@@ -1,9 +1,9 @@
+# gardeners/group5/strategy.py
 from __future__ import annotations
 
-import math
-import random
-from collections import defaultdict, deque
-from collections.abc import Iterable
+from contextlib import suppress
+from dataclasses import dataclass
+from math import hypot
 
 from core.garden import Garden
 from core.micronutrients import Micronutrient
@@ -12,276 +12,318 @@ from core.plants.species import Species
 from core.point import Position
 
 
-class TripletStrategy:
-    """Dense-packing strategy that keeps micronutrients balanced while filling space quickly."""
+@dataclass
+class _SimPlant:
+    variety: PlantVariety
+    x: float
+    y: float
+    inv: dict[Micronutrient, float]
 
-    _SUPPLIES = {
-        Species.RHODODENDRON: Micronutrient.R,
-        Species.GERANIUM: Micronutrient.G,
-        Species.BEGONIA: Micronutrient.B,
-    }
 
-    _CONSUMES = {
-        Species.RHODODENDRON: (Micronutrient.G, Micronutrient.B),
-        Species.GERANIUM: (Micronutrient.R, Micronutrient.B),
-        Species.BEGONIA: (Micronutrient.R, Micronutrient.G),
-    }
+class GreedyLocalStrategy:
+    """
+    One-by-one, nutrient-aware, dense placement strategy.
 
-    _NUTRIENT_ORDER = (Micronutrient.R, Micronutrient.G, Micronutrient.B)
+    Loop:
+      1. figure out which nutrient is currently the weakest in the real garden,
+      2. pick a species that produces that nutrient,
+      3. try that species' varieties at every dense candidate position,
+      4. for each hypothetical placement, run a tiny local nutrient sim,
+      5. place the best-scoring one,
+      6. repeat until nothing helps.
+    """
 
-    def __init__(self, garden: Garden, varieties: list[PlantVariety]):
+    BASE_STEP = 0.5  # candidate grid spacing
+    LOCAL_RADIUS = 7.0  # neighborhood radius for local sim
+    LOCAL_SIM_STEPS = 4  # how many synthetic "days" to run per test
+
+    def __init__(self, garden: Garden, varieties: list[PlantVariety]) -> None:
         self._garden = garden
         self._all_varieties = list(varieties)
-        self._species_pool = self._build_species_pool(varieties)
-        self._grid_step = self._determine_grid_step()
-        self._centre = Position(garden.width / 2.0, garden.height / 2.0)
+        # bucket varieties by species once
+        self._by_species: dict[Species, list[PlantVariety]] = {
+            Species.RHODODENDRON: [],
+            Species.GERANIUM: [],
+            Species.BEGONIA: [],
+        }
+        for v in self._all_varieties:
+            if v.species in self._by_species:
+                self._by_species[v.species].append(v)
 
-    # Public API ---------------------------------------------------------
-
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
     def cultivate(self) -> None:
-        if not self._all_varieties:
-            return
+        candidate_positions = self._build_dense_grid()
 
-        candidates = self._build_candidate_positions()
-        if not candidates:
-            return
-
-        # Kick-start with a central plant if possible to anchor clustering.
-        initial_species = self._select_species() or self._fallback_species()
-        if initial_species:
-            variety = self._take_variety(initial_species)
-            if variety:
-                centre_position = Position(self._centre.x, self._centre.y)
-                planted = self._attempt_direct_placement(variety, [centre_position])
-                if planted:
-                    self._remove_position_if_present(centre_position, candidates)
-                else:
-                    self._return_variety(initial_species, variety)
-
-        # Main planting loop: continue until no varieties remain or no space left.
-        safety_limit = len(self._all_varieties) * 2
-        while safety_limit > 0 and self._has_remaining_varieties():
-            safety_limit -= 1
-
-            target_species = self._select_species()
-            if target_species is None:
-                target_species = self._fallback_species()
-            if target_species is None:
+        # greedy loop
+        while True:
+            target_species = self._pick_species_to_help()
+            species_vars = self._by_species.get(target_species, [])
+            if not species_vars:
                 break
 
-            variety = self._take_variety(target_species)
-            if variety is None:
-                continue
+            # order varieties of that species by local efficiency
+            ordered_vars = sorted(
+                species_vars,
+                key=self._score_variety,
+                reverse=True,
+            )
 
-            if self._attempt_clustered_placement(variety, candidates):
-                continue
+            best_score = float('-inf')
+            best_choice: tuple[Position, PlantVariety] | None = None
 
-            # Fallback scatter attempts near the densest portion of the garden.
-            fallback_position = self._random_interior_spot(variety)
-            if fallback_position:
-                planted = self._garden.add_plant(variety, fallback_position)
-                if planted is not None:
-                    self._remove_position_if_present(fallback_position, candidates)
+            # scan positions
+            for pos in candidate_positions:
+                # try the best variety first for this species
+                placed_here = False
+                for var in ordered_vars:
+                    if not self._garden.can_place_plant(var, pos):
+                        continue
+
+                    score = self._simulate_local_and_score(pos, var)
+                    if score > best_score:
+                        best_score = score
+                        best_choice = (pos, var)
+                    placed_here = True
+                    # we tried the top variety at this spot; move to next spot
+                    break
+
+                # if no variety of the chosen species fits here, just continue
+                if not placed_here:
                     continue
 
-            # Could not place the variety; give it back for a later pass.
-            self._return_variety(target_species, variety)
-            break
+            # nothing good found
+            if best_choice is None or best_score <= 0:
+                break
 
-    # Variety bookkeeping -----------------------------------------------
+            pos, var = best_choice
+            planted = self._garden.add_plant(var, pos)
+            if planted is None:
+                # unexpected failure, bail
+                break
 
-    def _build_species_pool(
-        self, varieties: Iterable[PlantVariety]
-    ) -> dict[Species, deque[PlantVariety]]:
-        buckets: dict[Species, list[PlantVariety]] = defaultdict(list)
-        for variety in varieties:
-            buckets[variety.species].append(variety)
+            # we can drop the exact position so we don't re-use it
+            with suppress(ValueError):
+                candidate_positions.remove(pos)
 
-        pool: dict[Species, deque[PlantVariety]] = {}
-        for species, bucket in buckets.items():
-            bucket.sort(key=self._variety_priority, reverse=True)
-            pool[species] = deque(bucket)
-        return pool
+    # ------------------------------------------------------------------
+    # candidate position utilities
+    # ------------------------------------------------------------------
+    def _build_dense_grid(self) -> list[Position]:
+        pts: list[Position] = []
+        step = self.BASE_STEP
+        y = step
+        while y < self._garden.height - step:
+            x = step
+            while x < self._garden.width - step:
+                pts.append(Position(x, y))
+                x += step
+            y += step
+        return pts
 
-    def _variety_priority(self, variety: PlantVariety) -> float:
-        coeffs = variety.nutrient_coefficients
-        produce = coeffs.get(self._SUPPLIES.get(variety.species, Micronutrient.R), 0.0)
-        consume = sum(
-            abs(coeffs.get(nutrient, 0.0)) for nutrient in self._CONSUMES.get(variety.species, ())
-        )
-
-        efficiency = -abs(consume) if produce <= 0.0 else produce / (consume + 1e-6)
-
-        radius_penalty = 1.0 + variety.radius * variety.radius
-
-        # Favour balanced output while penalising larger radii.
-        return efficiency / radius_penalty
-
-    def _take_variety(self, species: Species) -> PlantVariety | None:
-        pool = self._species_pool.get(species)
-        if not pool:
-            return None
-        return pool.popleft()
-
-    def _return_variety(self, species: Species, variety: PlantVariety) -> None:
-        self._species_pool.setdefault(species, deque()).appendleft(variety)
-
-    def _has_remaining_varieties(self) -> bool:
-        return any(pool for pool in self._species_pool.values())
-
-    def _fallback_species(self) -> Species | None:
-        for species in (Species.RHODODENDRON, Species.GERANIUM, Species.BEGONIA):
-            if self._species_pool.get(species):
-                return species
-        return None
-
-    # Micronutrient targeting -------------------------------------------
-
-    def _select_species(self) -> Species | None:
-        nutrient_totals = self._current_nutrient_totals()
-
-        sorted_deficits = sorted(
-            self._NUTRIENT_ORDER,
-            key=lambda nutrient: (nutrient_totals[nutrient], self._NUTRIENT_ORDER.index(nutrient)),
-        )
-
-        for nutrient in sorted_deficits:
-            species = self._species_for_nutrient(nutrient)
-            if species and self._species_pool.get(species):
-                return species
-        return None
-
-    def _current_nutrient_totals(self) -> dict[Micronutrient, float]:
-        totals = {nutrient: 0.0 for nutrient in Micronutrient}
-        for plant in self._garden.plants:
-            for nutrient, amount in plant.variety.nutrient_coefficients.items():
-                totals[nutrient] += amount
+    # ------------------------------------------------------------------
+    # choosing what to plant (nutrient-driven)
+    # ------------------------------------------------------------------
+    def _current_net_nutrients(self) -> dict[Micronutrient, float]:
+        totals = {m: 0.0 for m in Micronutrient}
+        for p in self._garden.plants:
+            for m, amt in p.variety.nutrient_coefficients.items():
+                totals[m] += amt
         return totals
 
-    def _species_for_nutrient(self, nutrient: Micronutrient) -> Species | None:
-        for species, produces in self._SUPPLIES.items():
-            if produces == nutrient:
-                return species
-        return None
+    def _nutrient_to_species(self, nutrient: Micronutrient) -> Species:
+        if nutrient == Micronutrient.R:
+            return Species.RHODODENDRON
+        if nutrient == Micronutrient.G:
+            return Species.GERANIUM
+        return Species.BEGONIA
 
-    # Placement grid ----------------------------------------------------
+    def _pick_species_to_help(self) -> Species:
+        # no plants yet: start with red-producer
+        if not self._garden.plants:
+            return Species.RHODODENDRON
 
-    def _determine_grid_step(self) -> float:
-        if not self._all_varieties:
-            return 0.5
-        smallest = min(variety.radius for variety in self._all_varieties)
-        largest = max(variety.radius for variety in self._all_varieties)
-        base = max(0.2, smallest * 0.85)
-        # Cushion the step if radii differ widely to prevent invalid placements.
-        if largest > smallest * 1.5:
-            base *= 1.05
-        return base
+        nets = self._current_net_nutrients()
+        weakest = min(nets, key=lambda m: nets[m])
+        return self._nutrient_to_species(weakest)
 
-    def _build_candidate_positions(self) -> list[Position]:
-        positions: list[Position] = []
-        horizontal = self._grid_step
-        vertical = self._grid_step * 0.9
+    def _score_variety(self, v: PlantVariety) -> float:
+        """
+        Local intrinsic score: how good is this variety regardless of position?
+        Prefer varieties that strongly produce their main nutrient and are small.
+        """
+        coeffs = v.nutrient_coefficients
+        if v.species == Species.RHODODENDRON:
+            prod = coeffs.get(Micronutrient.R, 0.0)
+            cons = abs(coeffs.get(Micronutrient.G, 0.0)) + abs(coeffs.get(Micronutrient.B, 0.0))
+        elif v.species == Species.GERANIUM:
+            prod = coeffs.get(Micronutrient.G, 0.0)
+            cons = abs(coeffs.get(Micronutrient.R, 0.0)) + abs(coeffs.get(Micronutrient.B, 0.0))
+        else:
+            prod = coeffs.get(Micronutrient.B, 0.0)
+            cons = abs(coeffs.get(Micronutrient.R, 0.0)) + abs(coeffs.get(Micronutrient.G, 0.0))
 
-        y = vertical / 2.0
-        row = 0
-        while y < self._garden.height:
-            offset = (horizontal * 0.5) if row % 2 else 0.0
-            x = offset + horizontal / 2.0
-            while x < self._garden.width:
-                positions.append(Position(x, y))
-                x += horizontal
-            row += 1
-            y += vertical
+        eff = prod / (cons + 0.001)
+        size_bonus = 1.0 / (1.0 + v.radius)
+        return eff * size_bonus
 
-        positions.sort(key=self._centre_distance)
-        return positions
+    # ------------------------------------------------------------------
+    # local nutrient sim
+    # ------------------------------------------------------------------
+    def _dist(self, x1: float, y1: float, x2: float, y2: float) -> float:
+        return hypot(x1 - x2, y1 - y2)
 
-    def _remove_position_if_present(self, position: Position, positions: list[Position]) -> None:
-        for idx, candidate in enumerate(positions):
-            if math.isclose(candidate.x, position.x, abs_tol=1e-6) and math.isclose(
-                candidate.y, position.y, abs_tol=1e-6
-            ):
-                positions.pop(idx)
-                return
+    def _build_local_set(self, pos: Position, var: PlantVariety) -> list[_SimPlant]:
+        sims: list[_SimPlant] = []
+        # hypothetical new one (index 0)
+        base_inv = {
+            Micronutrient.R: 5.0 * var.radius,
+            Micronutrient.G: 5.0 * var.radius,
+            Micronutrient.B: 5.0 * var.radius,
+        }
+        sims.append(_SimPlant(variety=var, x=pos.x, y=pos.y, inv=base_inv))
 
-    # Placement scoring -------------------------------------------------
+        # nearby real plants
+        for planted in self._garden.plants:
+            d = self._dist(pos.x, pos.y, planted.position.x, planted.position.y)
+            if d <= self.LOCAL_RADIUS:
+                r = planted.variety.radius
+                inv = {
+                    Micronutrient.R: 5.0 * r,
+                    Micronutrient.G: 5.0 * r,
+                    Micronutrient.B: 5.0 * r,
+                }
+                sims.append(
+                    _SimPlant(
+                        variety=planted.variety,
+                        x=planted.position.x,
+                        y=planted.position.y,
+                        inv=inv,
+                    )
+                )
+        return sims
 
-    def _attempt_clustered_placement(
-        self, variety: PlantVariety, candidates: list[Position]
-    ) -> bool:
-        scored_indices = []
-        for idx, position in enumerate(candidates):
-            if not self._garden.can_place_plant(variety, position):
+    def _produce_step(self, sims: list[_SimPlant]) -> None:
+        for sp in sims:
+            coeffs = sp.variety.nutrient_coefficients
+            cap = 10.0 * sp.variety.radius
+            # only apply if no component goes negative
+            ok = True
+            for m, delta in coeffs.items():
+                if sp.inv[m] + delta < 0:
+                    ok = False
+                    break
+            if not ok:
                 continue
-            score = self._position_score(variety, position)
-            if score is not None:
-                scored_indices.append((score, idx))
+            for m, delta in coeffs.items():
+                sp.inv[m] = min(cap, sp.inv[m] + delta)
 
-        scored_indices.sort(reverse=True)
+    def _interaction_edges(self, sims: list[_SimPlant]) -> list[tuple[int, int]]:
+        edges: list[tuple[int, int]] = []
+        n = len(sims)
+        for i in range(n):
+            for j in range(i + 1, n):
+                vi = sims[i].variety
+                vj = sims[j].variety
+                if vi.species == vj.species:
+                    continue
+                d = self._dist(sims[i].x, sims[i].y, sims[j].x, sims[j].y)
+                if d < vi.radius + vj.radius:
+                    edges.append((i, j))
+        return edges
 
-        for _score, idx in scored_indices:
-            position = candidates[idx]
-            planted = self._garden.add_plant(variety, position)
-            if planted is not None:
-                candidates.pop(idx)
-                return True
-        return False
+    def _exchange_step(self, sims: list[_SimPlant]) -> None:
+        edges = self._interaction_edges(sims)
 
-    def _position_score(self, variety: PlantVariety, position: Position) -> float | None:
-        # Encourage higher overlap counts while keeping everything valid.
-        neighbor_tension = 0.0
-        for plant in self._garden.plants:
-            distance = self._euclidean(position, plant.position)
-            limit = variety.radius + plant.variety.radius
+        producer: list[Micronutrient] = []
+        neighbor_counts = [0] * len(sims)
+        for sp in sims:
+            if sp.variety.species == Species.RHODODENDRON:
+                producer.append(Micronutrient.R)
+            elif sp.variety.species == Species.GERANIUM:
+                producer.append(Micronutrient.G)
+            else:
+                producer.append(Micronutrient.B)
 
-            if distance < max(variety.radius, plant.variety.radius):
-                return None
+        for i, j in edges:
+            neighbor_counts[i] += 1
+            neighbor_counts[j] += 1
 
-            if distance < limit + 1e-6 and plant.variety.species != variety.species:
-                neighbor_tension += 2.0 + (limit - distance)
-            elif distance < limit * 1.2:
-                neighbor_tension += 0.5
+        for i, j in edges:
+            if neighbor_counts[i] == 0 or neighbor_counts[j] == 0:
+                continue
 
-        compactness_bonus = 1.0 / (1.0 + self._centre_distance(position))
-        return neighbor_tension * 5.0 + compactness_bonus
+            pi = producer[i]
+            pj = producer[j]
 
-    def _centre_distance(self, position: Position) -> float:
-        return self._euclidean(position, self._centre)
+            offer_i_total = sims[i].inv[pi] / 4.0
+            offer_j_total = sims[j].inv[pj] / 4.0
 
-    @staticmethod
-    def _euclidean(a: Position, b: Position) -> float:
-        dx = a.x - b.x
-        dy = a.y - b.y
-        return math.hypot(dx, dy)
+            per_i = offer_i_total / neighbor_counts[i]
+            per_j = offer_j_total / neighbor_counts[j]
 
-    # Auxiliary placement helpers --------------------------------------
+            # "has more of what it gives than what it receives"
+            if sims[i].inv[pi] <= sims[i].inv[pj]:
+                continue
+            if sims[j].inv[pj] <= sims[j].inv[pi]:
+                continue
 
-    def _attempt_direct_placement(
-        self, variety: PlantVariety, positions: Iterable[Position]
-    ) -> bool:
-        for position in positions:
-            if self._garden.can_place_plant(variety, position):
-                planted = self._garden.add_plant(variety, position)
-                if planted is not None:
-                    return True
-        return False
+            q = min(per_i, per_j)
+            if q <= 0:
+                continue
 
-    def _random_interior_spot(self, variety: PlantVariety, attempts: int = 40) -> Position | None:
-        pad = variety.radius * 1.05
-        min_x = pad
-        max_x = max(pad, self._garden.width - pad)
-        min_y = pad
-        max_y = max(pad, self._garden.height - pad)
+            cap_i = 10.0 * sims[i].variety.radius
+            cap_j = 10.0 * sims[j].variety.radius
 
-        for _ in range(attempts):
-            base_angle = random.uniform(0.0, 2.0 * math.pi)
-            radius = random.uniform(0.0, self._grid_step * 2.5)
-            centre_x = self._centre.x + math.cos(base_angle) * radius
-            centre_y = self._centre.y + math.sin(base_angle) * radius
+            sims[i].inv[pi] -= q
+            sims[i].inv[pj] = min(cap_i, sims[i].inv[pj] + q)
 
-            x = min(max(centre_x, min_x), max_x)
-            y = min(max(centre_y, min_y), max_y)
-            candidate = Position(x, y)
-            if self._garden.can_place_plant(variety, candidate):
-                return candidate
-        return None
+            sims[j].inv[pj] -= q
+            sims[j].inv[pi] = min(cap_j, sims[j].inv[pi] + q)
+
+    def _growth_step(self, sims: list[_SimPlant]) -> list[bool]:
+        grew = [False] * len(sims)
+        for idx, sp in enumerate(sims):
+            r = sp.variety.radius
+            need = 2.0 * r
+            if (
+                sp.inv[Micronutrient.R] >= need
+                and sp.inv[Micronutrient.G] >= need
+                and sp.inv[Micronutrient.B] >= need
+            ):
+                sp.inv[Micronutrient.R] -= r
+                sp.inv[Micronutrient.G] -= r
+                sp.inv[Micronutrient.B] -= r
+                grew[idx] = True
+        return grew
+
+    def _simulate_local_and_score(self, pos: Position, var: PlantVariety) -> float:
+        sims = self._build_local_set(pos, var)
+        new_idx = 0
+
+        total_neighbor_growth = 0
+        new_grew = False
+
+        for _ in range(self.LOCAL_SIM_STEPS):
+            self._produce_step(sims)
+            self._exchange_step(sims)
+            grew_flags = self._growth_step(sims)
+            if grew_flags[new_idx]:
+                new_grew = True
+            total_neighbor_growth += sum(grew_flags[1:])
+
+        # measure balance of the local set after sim
+        net_after = {Micronutrient.R: 0.0, Micronutrient.G: 0.0, Micronutrient.B: 0.0}
+        for sp in sims:
+            for m, delta in sp.variety.nutrient_coefficients.items():
+                net_after[m] += delta
+        balance_component = min(net_after.values())
+
+        score = 0.0
+        if new_grew:
+            score += 100.0
+        score += 5.0 * total_neighbor_growth
+        score += balance_component
+
+        return score
