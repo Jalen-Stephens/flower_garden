@@ -1,0 +1,51 @@
+# Group 5 Strategy Summary (since PrincipledStrategy)
+
+Date: November 7, 2025
+
+## 1. PrincipledStrategy (Initial Creation)
+- **Design:**
+  - Triad seeding: Places compact clusters of three plants using jittered hex anchors and sampled rotations.
+  - Deficit-driven lattice fill: Fills the garden with additional plants based on nutrient deficits, using a hex-like grid and scoring candidates for efficiency and interaction potential.
+  - Greedy fallback: Places remaining plants using a grid and a balance score blending efficiency, interaction, and deficit weights.
+  - SpatialBins: Accelerates neighbor lookups for interaction scoring.
+- **Parameters:**
+  - CLUSTER_LIMIT, MAX_TRIADS, LATTICE_JITTER, GREEDY_GRID_STEP, INTERACTION_RADIUS_FACTOR, TRIAD_ROTATIONS (all sweepable).
+- **Outcome:**
+  - Substantially improved growth and placement over previous Group 5 strategies; competitive with Group 2 on some configs.
+
+## 2. Benchmark Harness & Automation
+- **Script:** `benchmarks/run_sweep.py`
+  - Sweeps all config JSONs and multiple PrincipledStrategy parameter variants.
+  - Supports G5-only and full comparison modes (G2/G3 baselines).
+  - Results logged to CSV for analysis.
+- **Analyzer:** `benchmarks/analyze_results.py`
+  - Aggregates results by variant, computes averages/medians, and ranks by delta vs G2/G3.
+
+## 3. Iterative Variant Tuning
+- **Variants Explored:**
+  - Adjusted MAX_TRIADS, LATTICE_JITTER, GREEDY_GRID_STEP, INTERACTION_RADIUS_FACTOR, CLUSTER_LIMIT.
+  - Per-config sweeps to identify which parameters impact growth and placement.
+- **Findings:**
+  - Small configs (sapling/shrub/tree) show little sensitivity to parameter changes.
+  - Larger configs (four.json, easy.json, better.json) reveal more meaningful differences between variants.
+
+## 4. Targeted Testing Workflow
+- **Process:**
+  - Run G5-only sweeps first to optimize Group 5 performance.
+  - After tuning, run full comparison sweeps to benchmark against Group 2 and Group 3.
+  - Use analyzer to summarize and rank best-performing variants.
+
+## 5. Stability & Quality Gates
+- **Gardener2 Fixes:**
+  - Infinite loop risk in grid generation resolved (while True replaced with bounded checks).
+  - All tests pass (pytest: 90/90).
+- **Benchmark Harness:**
+  - Per-config and interleaved sweep modes; dynamic output file naming.
+
+## 6. Next Steps
+- Focus sweeps on larger, more complex configs to surface variant differences.
+- Use analyzer to guide further parameter tuning and strategy refinement.
+- Document and share top-performing parameter sets for future improvements.
+
+---
+This file summarizes all major strategy, benchmarking, and tuning work for Group 5 since the creation of PrincipledStrategy. For detailed results, see `benchmarks/results_g5.csv` and `benchmarks/summary.md`.
